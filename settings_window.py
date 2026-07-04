@@ -42,6 +42,12 @@ class SettingsWindow(QtWidgets.QDialog):
         self.hotkey_edit.setPlaceholderText("ctrl+alt+r")
         layout.addWidget(self.hotkey_edit)
 
+        # Show clean text (diagnostic toggle)
+        self.show_clean_check = QtWidgets.QCheckBox(
+            "Show cleaned text in playback window"
+        )
+        layout.addWidget(self.show_clean_check)
+
         # Buttons
         btn_row = QtWidgets.QHBoxLayout()
         self.apply_btn = QtWidgets.QPushButton("Apply")
@@ -63,6 +69,7 @@ class SettingsWindow(QtWidgets.QDialog):
         self.speed_slider.setValue(int(speed * 100))
         self._on_speed_changed(int(speed * 100))
         self.hotkey_edit.setText(cfg.get("shortcut", "ctrl+alt+r"))
+        self.show_clean_check.setChecked(bool(cfg.get("show_clean_text", False)))
 
     def _on_speed_changed(self, val):
         self.speed_value_label.setText(f"{val / 100.0:.2f}x")
@@ -71,10 +78,12 @@ class SettingsWindow(QtWidgets.QDialog):
         voice = self.voice_combo.currentText()
         speed = self.speed_slider.value() / 100.0
         hotkey = self.hotkey_edit.text().strip() or "ctrl+alt+r"
+        show_clean = self.show_clean_check.isChecked()
         old_hotkey = self.app.config.get("shortcut")  # capture BEFORE mutating
         self.app.config_manager.set("voice", voice)
         self.app.config_manager.set("speed", speed)
         self.app.config_manager.set("shortcut", hotkey)
+        self.app.config_manager.set("show_clean_text", show_clean)
         self.app.config = self.app.config_manager.config
         if hotkey != old_hotkey:
             self.app.reregister_hotkey()

@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     "voice": "af_heart",
     "speed": 1.0,
     "shortcut": "ctrl+alt+r",
+    "show_clean_text": False,
 }
 
 AVAILABLE_VOICES = [

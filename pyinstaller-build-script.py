@@ -215,6 +215,8 @@ def run_pyinstaller_build():
         "soundfile",
         "--hidden-import",
         "numpy",
+        "--add-data",
+        "text_cleaner.py:.",
         # Worker does NOT need PySide6 or pynput
         "--exclude-module",
         "PySide6",

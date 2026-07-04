@@ -1,4 +1,3 @@
-
 from PySide6 import QtCore, QtWidgets
 
 
@@ -14,6 +13,8 @@ class PlaybackWindow(QtWidgets.QWidget):
         super().__init__()
         self.app = app
         self.selected_text = ""
+        self._clean_text = None
+        self._show_clean_text = bool(app.config.get("show_clean_text", False))
         self._state = "idle"
         self._speed = float(app.config.get("speed", 1.0))
         self._voice = app.config.get("voice", "af_heart")
@@ -82,9 +83,24 @@ class PlaybackWindow(QtWidgets.QWidget):
 
     def set_selected_text(self, text):
         self.selected_text = text
-        preview = text if len(text) <= 500 else text[:500] + "…"
-        self.text_label.setText(preview)
-        self.setToolTip(text)
+        self._clean_text = None
+        self._render_preview()
+
+    def _render_preview(self):
+        """Show the Clean Text if the diagnostic toggle is on and it has
+        arrived; otherwise the raw Selection, exactly as before."""
+        if self._show_clean_text and self._clean_text is not None:
+            source = self._clean_text
+            label = "Cleaned"
+        else:
+            source = self.selected_text
+            label = None
+        preview = source if len(source) <= 500 else source[:500] + "…"
+        if label:
+            self.text_label.setText(f"[{label}]\n{preview}")
+        else:
+            self.text_label.setText(preview)
+        self.setToolTip(self.selected_text)
 
     # --- controls --------------------------------------------------------
     def _on_speed_changed(self, val):
@@ -119,29 +135,41 @@ class PlaybackWindow(QtWidgets.QWidget):
         self._kill_worker()
         self._set_state("loading")
         self.set_status("Loading engine…")
-        self._worker = self.app.tts.start_read(
+        self._worker = self.app.start_read(
             self.selected_text, self._voice, self._speed, on_event=self._on_worker_event
         )
 
     def _kill_worker(self):
         if self._worker is not None:
-            self.app.tts.stop_read(self._worker)
+            self.app.stop_read(self._worker)
             self._worker = None
 
     def _on_worker_event(self, evt):
         # Called from the worker's reader thread — bounce to Qt main thread.
+        # The "cleaned" event carries Clean Text under the "text" key; all
+        # other events use "msg".
+        event = evt.get("event", "")
+        if event == "cleaned":
+            msg = evt.get("text", "")
+        else:
+            msg = evt.get("msg", "")
         QtCore.QMetaObject.invokeMethod(
             self,
             "_handle_worker_event",
             QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(str, evt.get("event", "")),
-            QtCore.Q_ARG(str, evt.get("msg", "")),
+            QtCore.Q_ARG(str, event),
+            QtCore.Q_ARG(str, msg),
         )
 
     @QtCore.Slot(str, str)
     def _handle_worker_event(self, event, msg):
         if event == "loading":
             self.set_status("Loading engine…" if not msg else msg)
+        elif event == "cleaned":
+            # msg carries the Clean Text (post-Cleaner, pre-Phonemizer).
+            if self._show_clean_text:
+                self._clean_text = msg
+                self._render_preview()
         elif event == "synthesizing":
             self.set_status("Synthesizing…")
         elif event == "playing":

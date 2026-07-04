@@ -16,7 +16,13 @@ captured here as they are resolved during design.
 - **Selection** — The text the user has highlighted in whatever
   application currently has focus at the moment the hotkey is pressed.
   Captured by injecting Ctrl+C and polling the clipboard (mirrors
-  WritingTool).
+  WritingTool). In practice a **Selection** is *rendered plain text*:
+  Unicode-rich prose as the source application emitted it to the
+  clipboard, not a structured document. It carries real Unicode
+  punctuation (smart quotes, em/en dashes, ellipsis, bullets),
+  invisible characters (NBSP, zero-width, soft hyphen), and
+  line-wrap artifacts — but generally not raw markdown syntax, since
+  the user copies from rendered surfaces.
 
 - **Read Session** — A single playback lifecycle: from hotkey press
   through capture, synthesis, playback, to natural completion or a
@@ -68,3 +74,29 @@ captured here as they are resolved during design.
 
 - **Settings** — User-editable configuration (voice, default speed,
   hotkey) persisted to `config.json`, edited via the Settings window.
+
+- **Phonemizer** — The G2P stage inside the TTS Worker that converts
+  the cleaned `Selection` into IPA phonemes for the Kokoro model. It is
+  espeak-ng (via the `phonemizer` library, as wrapped by kokoro-onnx
+  `Tokenizer.phonemize`), which already expands numbers and basic
+  abbreviations and preserves ASCII punctuation.
+
+- **Cleaner** — The pure-function preprocessor that runs in the TTS
+  Worker, between clipboard handoff and the `Phonemizer`. Its job is
+  to turn a `Selection` into **Clean Text**: rendered-plain-text
+  hygiene (invisible-char removal, Unicode-symbol → ASCII or spoken
+  replacement, line-wrap repair) and symbol-to-prose translation
+  (e.g. `→` → "to", `•` → "-") so the `Phonemizer` never sees
+  glyphs it will misread or silently drop. It deliberately does
+  *not* duplicate work the `Phonemizer` already does (numbers,
+  contractions, ASCII punctuation) and does *not* attempt to parse
+  raw markdown, since a `Selection` is rendered text.
+
+- **Clean Text** — The output of the `Cleaner`: the `Selection` with
+  invisible characters removed, Unicode glyphs replaced by ASCII or
+  spoken-word equivalents, and line-wrap artifacts repaired, but
+  with prose, numbers, contractions, and ASCII punctuation otherwise
+  untouched. It is the exact string handed to the `Phonemizer`. In
+  the current build the TTS Worker emits it back to the Daemon as the
+  `cleaned` event so the `Playback Window` can display it for
+  inspection.

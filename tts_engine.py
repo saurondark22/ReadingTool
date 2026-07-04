@@ -73,6 +73,77 @@ def download_models(on_progress=None):
     logging.info("All model files present")
 
 
+class TTSEngine:
+    """Thin wrapper around the Kokoro ONNX engine used by the TTS Worker.
+
+    Lives only in the worker process (the Daemon never instantiates this).
+    Lazily loads the model + voices, then exposes a chunked `synth_stream`
+    generator that yields (samples, sample_rate) tuples — one per phoneme
+    batch — so the worker can play audio chunk-by-chunk as it synthesizes.
+    """
+
+    def __init__(self):
+        self._kokoro = None
+        self._model_path = model_path()
+        self._voices_path = voices_path()
+
+    def ensure_load(self):
+        """Lazily load the Kokoro engine + model. Returns True on success."""
+        if self._kokoro is not None:
+            return True
+        try:
+            from kokoro_onnx import Kokoro
+
+            logging.debug(
+                f"Loading Kokoro engine: model={self._model_path} voices={self._voices_path}"
+            )
+            self._kokoro = Kokoro(self._model_path, self._voices_path)
+            logging.debug("Kokoro engine loaded")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to load Kokoro engine: {e}", exc_info=True)
+            self._kokoro = None
+            return False
+
+    def synth_stream(self, text, voice, speed):
+        """Yield (samples_ndarray, sample_rate) chunks for the given text.
+
+        Splits the text into phoneme batches via the engine's internal
+        splitter and synthesizes each batch separately so playback can
+        start before the whole text is processed.
+
+        The first chunk is NOT trimmed — librosa's default trim (top_db=60)
+        is aggressive enough to clip soft word onsets, so the first words
+        get cut. Subsequent chunks get a gentler top_db=30 trim that only
+        removes the long leading silence Kokoro emits (~2s) without eating
+        into speech.
+        """
+        if self._kokoro is None:
+            raise RuntimeError("Engine not loaded; call ensure_load() first")
+        # Clamp speed to Kokoro's accepted range.
+        speed = max(0.5, min(2.0, float(speed)))
+        # Resolve voice id -> style array up front (validates the id).
+        voice_style = self._kokoro.get_voice_style(voice)
+        lang = "en-us"
+        phonemes = self._kokoro.tokenizer.phonemize(text, lang)
+        batches = self._kokoro._split_phonemes(phonemes)
+        from kokoro_onnx.trim import trim as trim_audio
+
+        first = True
+        for i, batch in enumerate(batches):
+            if not batch.strip():
+                continue
+            audio, sr = self._kokoro._create_audio(batch, voice_style, speed)
+            if first:
+                # Don't trim the very first chunk — preserve word onsets.
+                first = False
+            else:
+                # Gentle trim: only long leading silence, not speech.
+                audio, _ = trim_audio(audio, top_db=30)
+            logging.debug(f"Synth chunk {i}: {len(audio)} samples @ {sr}Hz")
+            yield audio, sr
+
+
 def _worker_script():
     """Path to the tts_worker script (or the frozen worker binary)."""
     if getattr(sys, "frozen", False):
@@ -166,15 +237,21 @@ class WorkerProcess:
                 self.kill()
 
     def kill(self):
-        """Kill the worker process immediately (Stop / close window)."""
+        """Stop the worker: SIGTERM first (lets it call sd.stop() to cut
+        buffered audio), then SIGKILL if it doesn't exit promptly."""
         if self._proc is None:
             return
         self._killed = True
         try:
-            self._proc.kill()
-            self._proc.wait(timeout=3.0)
-        except Exception:
-            pass
+            self._proc.terminate()  # SIGTERM — graceful stop
+            try:
+                self._proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                logging.debug("Worker didn't exit on SIGTERM; SIGKILL")
+                self._proc.kill()
+                self._proc.wait(timeout=3.0)
+        except Exception as e:
+            logging.debug(f"Worker kill error: {e}")
         logging.debug("Worker killed")
 
     def wait(self, timeout=None):

@@ -21,6 +21,7 @@ heavy audio + ML libs live only in this process, never in the Daemon.
 
 import json
 import logging
+import signal
 import sys
 import threading
 
@@ -29,6 +30,25 @@ logging.basicConfig(
     format="%(asctime)s - WORKER - %(levelname)s - %(message)s",
     stream=sys.stderr,
 )
+
+# Set when the daemon signals Stop (SIGTERM). The playback loop and the
+# synth generator poll this so they can halt promptly. Also drives
+# sd.stop() to cut any audio already buffered by the sound server.
+_stop_flag = threading.Event()
+_sd = None
+
+
+def _handle_stop(signum, frame):
+    logging.debug("Stop signal received; halting playback")
+    _stop_flag.set()
+    try:
+        if _sd is not None:
+            _sd.stop()
+    except Exception as e:
+        logging.debug(f"sd.stop() on signal failed: {e}")
+
+
+signal.signal(signal.SIGTERM, _handle_stop)
 
 
 def _emit(event, **extra):
@@ -58,6 +78,7 @@ def _run():
         voice = params.get("voice", "af_heart")
         speed = float(params.get("speed", 1.0))
     except Exception as e:
+        logging.error(f"Bad input parse: {e}", exc_info=True)
         _emit("error", msg=f"Bad input: {e}")
         return 1
 
@@ -65,11 +86,34 @@ def _run():
         _emit("error", msg="Empty text")
         return 1
 
+    # Strip markdown/symbols that the phonemizer would read as garbage.
+    try:
+        from text_cleaner import clean_for_tts
+
+        raw_len = len(text)
+        text = clean_for_tts(text)
+        logging.debug(f"Text cleaned: {raw_len} -> {len(text)} chars")
+        _emit("cleaned", text=text)
+    except Exception as e:
+        logging.debug(f"Text cleaner skipped: {e}")
+        _emit("cleaned", text=text)
+    if not text.strip():
+        _emit("error", msg="Empty text after cleaning")
+        return 1
+
     try:
         import sounddevice as sd
     except OSError as e:
+        logging.error(f"PortAudio/sounddevice import failed: {e}", exc_info=True)
         _emit("error", msg=f"PortAudio not found: {e}. Install libportaudio2.")
         return 1
+    except Exception as e:
+        logging.error(f"Unexpected sounddevice import error: {e}", exc_info=True)
+        _emit("error", msg=f"Audio backend error: {e}")
+        return 1
+
+    global _sd
+    _sd = sd
 
     _emit("loading", phase="engine")
 
@@ -77,10 +121,15 @@ def _run():
         from tts_engine import TTSEngine
 
         engine = TTSEngine()
-        if not engine.ensure_loaded():
+        if not engine.ensure_load():
             _emit("error", msg="Failed to load Kokoro engine")
             return 1
+    except ImportError as e:
+        logging.error(f"TTSEngine import failed: {e}", exc_info=True)
+        _emit("error", msg=f"Engine import failed: {e}")
+        return 1
     except Exception as e:
+        logging.error(f"Engine load failed: {e}", exc_info=True)
         _emit("error", msg=f"Engine load failed: {e}")
         return 1
 
@@ -89,7 +138,7 @@ def _run():
     # Playback loop: synthesize chunk-by-chunk, play each immediately.
     # A prefetch thread synthesizes the next chunk while the current one
     # plays, so audio stays continuous with minimal gaps.
-    stop_flag = threading.Event()
+    stop_flag = _stop_flag
 
     def _synth_iter():
         for chunk in engine.synth_stream(text, voice, speed):
@@ -105,6 +154,10 @@ def _run():
         next_chunk = next(synth_gen)
     except StopIteration:
         _emit("error", msg="No audio produced")
+        return 1
+    except Exception as e:
+        logging.error(f"Synthesis failed: {e}", exc_info=True)
+        _emit("error", msg=f"Synthesis failed: {e}")
         return 1
 
     while next_chunk is not None:
@@ -135,6 +188,7 @@ def _run():
             sd.play(samples, sr)
             sd.wait()
         except Exception as e:
+            logging.error(f"Playback error: {e}", exc_info=True)
             _emit("error", msg=f"Playback error: {e}")
             return 1
 
