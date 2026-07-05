@@ -1,6 +1,8 @@
 {
     "voice": "af_heart",
     "speed": 1.0,
-    "shortcut": "ctrl+alt+r",
-    "is_config_file_updated_for_v1": true
+    "shortcut": "alt+w",
+    "is_config_file_updated_for_v1": true,
+    "show_clean_text": true,
+    "debug_mode": true
 }

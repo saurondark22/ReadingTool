@@ -6,7 +6,7 @@ from reading_tool_app import ReadingToolApp
 
 def main():
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     app = ReadingToolApp(sys.argv)

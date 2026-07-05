@@ -20,6 +20,8 @@ import sys
 import threading
 import urllib.request
 
+import numpy as np
+
 MODEL_FILENAME = "kokoro-v1.0.onnx"
 VOICES_FILENAME = "voices-v1.0.bin"
 MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
@@ -105,12 +107,90 @@ class TTSEngine:
             self._kokoro = None
             return False
 
+    # --- chunking parameters --------------------------------------------
+    # One Chunk is a batch of phonemes synthesized in one ONNX inference
+    # call.  The word is the atomic unit (never cut mid-word).  We prefer
+    # sentence terminators, fall back to clause punctuation, and at the
+    # hard cap we cut at a word boundary so a run-on sentence never
+    # produces a catastrophically long batch.  MIN_CAP prevents micro-
+    # batches from sequences like ". . . ." so each batch carries at
+    # least one real word of speech.
+    MIN_CAP = 10  # phonemes — don't end a batch before at least this many
+    SOFT_CAP = 120  # phonemes — prefer to cut at or before this
+    HARD_CAP = 200  # phonemes — never exceed this
+
+    @staticmethod
+    def _split_phonemes(
+        phonemes, min_cap=MIN_CAP, soft_cap=SOFT_CAP, hard_cap=HARD_CAP
+    ):
+        """Split a phoneme string into word-bounded batches.
+
+        Walks the phoneme string word-by-word (space-delimited) and ends a
+        batch when:
+          1. A word ending in any punctuation (. ! ? , ; :) is seen past
+             ``min_cap`` — preferred (natural prosody break).  This makes
+             the first batch as small as possible so audio starts fast.
+          2. No punctuation appears within ``soft_cap`` phonemes — cut at
+             the next word boundary past ``soft_cap``.
+          3. No word boundary within ``hard_cap`` phonemes (a run-on
+             sentence) — cut at a word boundary anyway so the batch is
+             never catastrophically long.
+
+        Never splits mid-word.  Never ends a batch before ``min_cap``
+        phonemes so sequences of lone punctuation (". . . .") don't
+        produce one-batch-per-period.
+        """
+        words = phonemes.split(" ")
+        batches = []
+        current_words: list[str] = []
+        current_len = 0
+
+        def _end_batch():
+            nonlocal current_words, current_len
+            if current_words:
+                batches.append(" ".join(current_words).strip())
+                current_words = []
+                current_len = 0
+
+        for word in words:
+            word = word.strip()
+            if not word:
+                continue
+            word_len = len(word) + (1 if current_words else 0)
+
+            current_words.append(word)
+            current_len += word_len
+
+            # Don't end a batch before min_cap (prevents micro-batches).
+            if current_len < min_cap:
+                continue
+
+            # Any punctuation past min_cap — preferred break (smallest
+            # possible batches for fast first-audio).
+            if word and word[-1] in ".!?,;:":
+                _end_batch()
+                continue
+
+            # Soft cap — cut at word boundary if past it.
+            if current_len >= soft_cap:
+                _end_batch()
+                continue
+
+            # Hard cap — force a break (run-on sentence).
+            if current_len >= hard_cap:
+                _end_batch()
+
+        _end_batch()
+        return [b for b in batches if b]
+
     def synth_stream(self, text, voice, speed):
         """Yield (samples_ndarray, sample_rate) chunks for the given text.
 
-        Splits the text into phoneme batches via the engine's internal
-        splitter and synthesizes each batch separately so playback can
-        start before the whole text is processed.
+        Phonemizes the whole text in one G2P pass (fast, preserves cross-
+        sentence continuity), then splits the phoneme string into small
+        word-bounded batches via :meth:`_split_phonemes`.  Each batch is
+        synthesized separately so playback can start after the first
+        sentence rather than waiting for the whole text.
 
         The first chunk is NOT trimmed — librosa's default trim (top_db=60)
         is aggressive enough to clip soft word onsets, so the first words
@@ -120,27 +200,26 @@ class TTSEngine:
         """
         if self._kokoro is None:
             raise RuntimeError("Engine not loaded; call ensure_load() first")
-        # Clamp speed to Kokoro's accepted range.
         speed = max(0.5, min(2.0, float(speed)))
-        # Resolve voice id -> style array up front (validates the id).
         voice_style = self._kokoro.get_voice_style(voice)
         lang = "en-us"
         phonemes = self._kokoro.tokenizer.phonemize(text, lang)
-        batches = self._kokoro._split_phonemes(phonemes)
+        batches = self._split_phonemes(phonemes)
+        logging.info(f"Phonemize: {len(phonemes)} phonemes -> {len(batches)} batches")
         from kokoro_onnx.trim import trim as trim_audio
 
         first = True
         for i, batch in enumerate(batches):
             if not batch.strip():
                 continue
+            logging.info(f"Batch {i}/{len(batches)}: {batch}")
             audio, sr = self._kokoro._create_audio(batch, voice_style, speed)
+            dur = np.asarray(audio).ravel().shape[0] / sr
+            logging.info(f"Batch {i}: done, {dur:.2f}s audio")
             if first:
-                # Don't trim the very first chunk — preserve word onsets.
                 first = False
             else:
-                # Gentle trim: only long leading silence, not speech.
                 audio, _ = trim_audio(audio, top_db=30)
-            logging.debug(f"Synth chunk {i}: {len(audio)} samples @ {sr}Hz")
             yield audio, sr
 
 
@@ -164,15 +243,18 @@ class WorkerProcess:
         self.on_event = on_event or (lambda evt: None)
         self._proc = None
         self._reader_thread = None
+        self._stderr_thread = None
         self._watcher_thread = None
         self._killed = False
+        self._debug_mode = False
 
     @property
     def is_running(self):
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self, text, voice, speed):
+    def start(self, text, voice, speed, debug_mode=False):
         """Spawn the worker, feed it params on stdin, start reading stdout."""
+        self._debug_mode = debug_mode
         script = _worker_script()
         is_python = script.endswith(".py")
 
@@ -195,7 +277,14 @@ class WorkerProcess:
             self.on_event({"event": "error", "msg": f"Spawn failed: {e}"})
             return
 
-        params = json.dumps({"text": text, "voice": voice, "speed": speed})
+        params = json.dumps(
+            {
+                "text": text,
+                "voice": voice,
+                "speed": speed,
+                "debug_mode": debug_mode,
+            }
+        )
         try:
             self._proc.stdin.write(params + "\n")
             self._proc.stdin.flush()
@@ -206,6 +295,9 @@ class WorkerProcess:
 
         self._reader_thread = threading.Thread(target=self._read_events, daemon=True)
         self._reader_thread.start()
+
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
 
         self._watcher_thread = threading.Thread(target=self._watch_timeout, daemon=True)
         self._watcher_thread.start()
@@ -223,6 +315,32 @@ class WorkerProcess:
                     logging.debug(f"Worker non-JSON line: {line}")
         except Exception as e:
             logging.debug(f"Worker stdout read ended: {e}")
+
+    def _read_stderr(self):
+        """Forward worker stderr to the daemon's logging.
+
+        Always forwards WARNING+ (errors, timeouts).  INFO/DEBUG lines
+        (lifecycle events) are forwarded only when debug_mode is on.
+        """
+        try:
+            for line in self._proc.stderr:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # Worker log lines look like:
+                #   "2026-... - WORKER - LEVEL - message"
+                # Detect the level to decide whether to forward.
+                if " - WORKER - " in line:
+                    level_part = line.split(" - WORKER - ")[1].split(" - ")[0]
+                    if level_part in ("WARNING", "ERROR", "CRITICAL"):
+                        logging.warning(f"[WORKER] {line}")
+                    elif self._debug_mode:
+                        logging.info(f"[WORKER] {line}")
+                else:
+                    # Non-worker-format line (e.g. Python traceback) — always log.
+                    logging.warning(f"[WORKER] {line}")
+        except Exception as e:
+            logging.debug(f"Worker stderr read ended: {e}")
 
     def _watch_timeout(self):
         """Safety net: if the worker hasn't exited after WORKER_TIMEOUT_S,

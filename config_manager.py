@@ -10,6 +10,7 @@ DEFAULT_CONFIG = {
     "speed": 1.0,
     "shortcut": "ctrl+alt+r",
     "show_clean_text": False,
+    "debug_mode": False,
 }
 
 AVAILABLE_VOICES = [

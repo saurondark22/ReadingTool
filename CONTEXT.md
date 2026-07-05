@@ -90,13 +90,43 @@ captured here as they are resolved during design.
   glyphs it will misread or silently drop. It deliberately does
   *not* duplicate work the `Phonemizer` already does (numbers,
   contractions, ASCII punctuation) and does *not* attempt to parse
-  raw markdown, since a `Selection` is rendered text.
+  raw markdown, since a `Selection` is rendered text. It also drops
+  **noise**: ASCII control chars (everything below 0x20 except `\t`
+  and `\n`, plus DEL) and **structural punctuation** (`() [] {}`)
+  that carry no speech and no prosody, leaving **prosody
+  punctuation** (`. , ! ? ; : - … " '` and significant symbols like
+  `$ @ ~ % + =`) intact. Every surviving line break (paragraph or
+  line) is converted to a sentence terminator (`". "`) so a line
+  that ended without punctuation still marks a `Chunk` boundary.
 
 - **Clean Text** — The output of the `Cleaner`: the `Selection` with
   invisible characters removed, Unicode glyphs replaced by ASCII or
-  spoken-word equivalents, and line-wrap artifacts repaired, but
-  with prose, numbers, contractions, and ASCII punctuation otherwise
+  spoken-word equivalents, line-wrap artifacts repaired, structural
+  brackets dropped, ASCII control chars dropped, and every surviving
+  line break converted to a sentence terminator (`". "`), but with
+  prose, numbers, contractions, and prosody punctuation otherwise
   untouched. It is the exact string handed to the `Phonemizer`. In
   the current build the TTS Worker emits it back to the Daemon as the
   `cleaned` event so the `Playback Window` can display it for
   inspection.
+
+- **Chunk** — One batch of phonemes that the TTS Worker synthesizes
+  into one audio segment and feeds to the ringbuffer playback stream.
+  A `Chunk` is cut from the phoneme string (post-`Phonemizer`) with the
+  **word** as the atomic unit: a boundary never lands mid-word.
+  Splitting breaks at any punctuation (`. ! ? , ; :`) past a minimum
+  cap (~10 phonemes), so the first chunk is as small as possible for
+  fast first-audio. Because the `Cleaner` already turned every
+  surviving line break into a `"."`, line and paragraph boundaries
+  act as `Chunk` boundaries without the splitter knowing about `\n`.
+  If no punctuation appears within the soft cap (~120 phonemes), it
+  cuts at a word boundary; a hard cap (~200 phonemes) ensures a run-on
+  sentence never produces a catastrophically long batch. The minimum
+  cap prevents micro-batches from sequences of lone punctuation
+  (`. . . .`). The soft/hard caps are measured in phonemes (a latency
+  proxy), but the unit is the word (a prosody boundary). One `Chunk`
+  is the granularity at which audio starts (the first `Chunk` primes
+  the ringbuffer) and at which the synthesis thread stays ahead of
+  playback. The TTS Worker keeps at most ~2 `Chunk`s buffered ahead of
+  playback (prefetch depth) so played clips are released from memory
+  as soon as they finish.

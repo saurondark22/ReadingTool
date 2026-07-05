@@ -25,21 +25,25 @@ import signal
 import sys
 import threading
 
+import numpy as np
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s - WORKER - %(levelname)s - %(message)s",
     stream=sys.stderr,
 )
 
-# Set when the daemon signals Stop (SIGTERM). The playback loop and the
-# synth generator poll this so they can halt promptly. Also drives
-# sd.stop() to cut any audio already buffered by the sound server.
 _stop_flag = threading.Event()
 _sd = None
 
 
+def _set_debug(enabled):
+    """Raise logging to INFO when debug_mode is on; WARNING otherwise."""
+    logging.getLogger().setLevel(logging.DEBUG if enabled else logging.WARNING)
+
+
 def _handle_stop(signum, frame):
-    logging.debug("Stop signal received; halting playback")
+    logging.info("Stop signal received; halting playback")
     _stop_flag.set()
     try:
         if _sd is not None:
@@ -67,6 +71,171 @@ def _ensure_models():
     return model_path(), voices_path()
 
 
+class _StreamPlayer:
+    """Gapless ringbuffer playback for chunked TTS audio.
+
+    A synthesis thread calls :meth:`put` with ``(samples, sample_rate)``
+    tuples; a single ``sd.OutputStream`` callback drains the internal
+    buffer sample-by-sample.  The first chunk primes the buffer so audio
+    starts as soon as it arrives; subsequent chunks fill ahead while
+    earlier audio plays.  Under-runs degrade to brief silence rather than
+    hard stops.
+    """
+
+    PREFETCH = 2
+
+    def __init__(self, stop_flag: threading.Event):
+        self._stop_flag = stop_flag
+        self._queue: list[tuple] = []
+        self._queue_lock = threading.Lock()
+        self._cv = threading.Condition(self._queue_lock)
+        self._eos = False
+        self._stream = None
+        self._sr = None
+        self._offset = 0
+        self._current = None
+        self._playing = False
+        self._done = False
+        self._started_first_chunk = False
+        self._chunk_count = 0
+
+    def put(self, chunk):
+        """Add a (samples, sample_rate) chunk to the buffer.
+
+        Flattens the array to 1-D: Kokoro's ONNX output is shape (1, N)
+        (batch dimension + samples), but the OutputStream callback indexes
+        sample-by-sample and needs a 1-D array.
+
+        Blocks if PREFETCH chunks are already queued so the synth thread
+        stays only ~2 batches ahead of playback, releasing memory for
+        played clips instead of synthesizing the whole text up front.
+        """
+        samples, sr = chunk
+        samples = np.asarray(samples, dtype=np.float32).ravel()
+        idx = self._chunk_count
+        self._chunk_count += 1
+        dur = len(samples) / sr
+        logging.info(f"Chunk {idx} queued: {len(samples)} samples, {dur:.2f}s")
+        with self._cv:
+            while len(self._queue) >= self.PREFETCH and not self._stop_flag.is_set():
+                self._cv.wait(timeout=0.5)
+            if self._stop_flag.is_set():
+                return
+            self._queue.append((samples, sr))
+            self._cv.notify_all()
+
+    def end_of_stream(self):
+        """Signal that no more chunks will arrive."""
+        with self._cv:
+            self._eos = True
+            logging.info("End of stream: all chunks synthesized")
+            self._cv.notify_all()
+
+    def start(self) -> bool:
+        """Open the OutputStream.  Returns False on failure.
+
+        Waits briefly for the first chunk so we know the sample rate
+        (Kokoro always outputs 24000 Hz), then opens a mono float32
+        OutputStream at that rate.
+        """
+        with self._cv:
+            if not self._queue and not self._eos:
+                self._cv.wait(timeout=2.0)
+            if self._queue:
+                self._sr = self._queue[0][1]
+        if self._sr is None:
+            self._sr = 24000
+
+        try:
+            self._stream = _sd.OutputStream(
+                samplerate=self._sr,
+                channels=1,
+                dtype="float32",
+                callback=self._callback,
+                finished_callback=self._finished,
+            )
+            self._stream.start()
+            logging.info(f"Audio stream opened: {self._sr}Hz, mono, float32")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to open OutputStream: {e}", exc_info=True)
+            return False
+
+    def _callback(self, outdata: np.ndarray, frames: int, *_):
+        """PortAudio callback — fill outdata from the chunk buffer.
+
+        MUST NOT block.  If the buffer is empty (under-run), output silence
+        and return immediately.  The synthesis thread keeps the buffer primed
+        ahead of playback so under-runs are rare.
+        """
+        try:
+            outdata[:] = 0
+            written = 0
+
+            while written < frames and not self._stop_flag.is_set():
+                if self._current is None or self._offset >= len(self._current):
+                    with self._cv:
+                        if not self._queue:
+                            if self._eos:
+                                self._done = True
+                                self._cv.notify_all()
+                                logging.info("Playback complete: EOS, buffer drained")
+                                return
+                            return
+                        self._current, self._sr = self._queue.pop(0)
+                        self._offset = 0
+                        self._started_first_chunk = True
+                        self._cv.notify_all()
+                        logging.info(
+                            f"Chunk playing: {len(self._current)} samples, "
+                            f"{len(self._queue)} remaining in queue"
+                        )
+
+                avail = len(self._current) - self._offset
+                need = frames - written
+                n = min(avail, need)
+
+                outdata[written : written + n, 0] = self._current[
+                    self._offset : self._offset + n
+                ]
+
+                self._offset += n
+                written += n
+                self._playing = True
+        except Exception as e:
+            logging.error(f"EXCEPTION in audio callback: {e}", exc_info=True)
+            raise
+
+    def _finished(self, _=None):
+        logging.info("Audio stream finished")
+
+    @property
+    def is_playing(self) -> bool:
+        return self._playing
+
+    @property
+    def is_done(self) -> bool:
+        return self._done
+
+    def wait_step(self, timeout):
+        """Sleep briefly so the main loop can poll without busy-waiting."""
+        with self._cv:
+            if not self._done and not self._stop_flag.is_set():
+                self._cv.wait(timeout=timeout)
+
+    def stop(self):
+        """Close the stream and discard any buffered audio."""
+        try:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+        except Exception as e:
+            logging.debug(f"Stream stop error: {e}")
+        with self._cv:
+            self._queue.clear()
+            self._cv.notify_all()
+
+
 def _run():
     raw = sys.stdin.readline()
     if not raw:
@@ -77,22 +246,24 @@ def _run():
         text = params.get("text", "")
         voice = params.get("voice", "af_heart")
         speed = float(params.get("speed", 1.0))
+        debug_mode = bool(params.get("debug_mode", False))
     except Exception as e:
         logging.error(f"Bad input parse: {e}", exc_info=True)
         _emit("error", msg=f"Bad input: {e}")
         return 1
 
+    _set_debug(debug_mode)
+
     if not text.strip():
         _emit("error", msg="Empty text")
         return 1
 
-    # Strip markdown/symbols that the phonemizer would read as garbage.
     try:
         from text_cleaner import clean_for_tts
 
         raw_len = len(text)
         text = clean_for_tts(text)
-        logging.debug(f"Text cleaned: {raw_len} -> {len(text)} chars")
+        logging.info(f"Text cleaned: {raw_len} -> {len(text)} chars")
         _emit("cleaned", text=text)
     except Exception as e:
         logging.debug(f"Text cleaner skipped: {e}")
@@ -135,68 +306,60 @@ def _run():
 
     _emit("synthesizing")
 
-    # Playback loop: synthesize chunk-by-chunk, play each immediately.
-    # A prefetch thread synthesizes the next chunk while the current one
-    # plays, so audio stays continuous with minimal gaps.
     stop_flag = _stop_flag
+    synth_error = [None]
 
-    def _synth_iter():
-        for chunk in engine.synth_stream(text, voice, speed):
-            if stop_flag.is_set():
-                break
-            yield chunk
+    def _synth_thread():
+        """Synthesize all chunks and push them to the playback queue."""
+        try:
+            logging.info(f"Synthesis started: {len(text)} chars")
+            for chunk in engine.synth_stream(text, voice, speed):
+                if stop_flag.is_set():
+                    logging.info("Synthesis stopped by user")
+                    break
+                _player.put(chunk)
+            logging.info("Synthesis complete: all batches processed")
+        except Exception as e:
+            logging.error(f"Synthesis error: {e}", exc_info=True)
+            synth_error[0] = e
+        finally:
+            _player.end_of_stream()
+
+    _player = _StreamPlayer(stop_flag)
+
+    synth_t = threading.Thread(target=_synth_thread, daemon=True)
+    synth_t.start()
+
+    if not _player.start():
+        _emit("error", msg="Failed to open audio output stream")
+        return 1
 
     first = True
-    next_chunk = None
 
-    synth_gen = _synth_iter()
-    try:
-        next_chunk = next(synth_gen)
-    except StopIteration:
-        _emit("error", msg="No audio produced")
-        return 1
-    except Exception as e:
-        logging.error(f"Synthesis failed: {e}", exc_info=True)
-        _emit("error", msg=f"Synthesis failed: {e}")
-        return 1
-
-    while next_chunk is not None:
+    while True:
         if stop_flag.is_set():
             break
-
-        # Prefetch the next chunk in a thread while this one plays.
-        current = next_chunk
-        prefetch_result = {}
-
-        def _prefetch():
-            try:
-                prefetch_result["chunk"] = next(synth_gen)
-            except StopIteration:
-                prefetch_result["chunk"] = None
-            except Exception as e:
-                prefetch_result["error"] = e
-
-        prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
-        prefetch_thread.start()
-
-        if first:
+        if synth_error[0] is not None:
+            _emit("error", msg=f"Synthesis failed: {synth_error[0]}")
+            _player.stop()
+            return 1
+        if _player.is_done:
+            break
+        if first and _player.is_playing:
             _emit("playing")
             first = False
+        _player.wait_step(0.05)
 
-        samples, sr = current
-        try:
-            sd.play(samples, sr)
-            sd.wait()
-        except Exception as e:
-            logging.error(f"Playback error: {e}", exc_info=True)
-            _emit("error", msg=f"Playback error: {e}")
-            return 1
+    _player.stop()
+    if synth_error[0] is not None:
+        _emit("error", msg=f"Synthesis failed: {synth_error[0]}")
+        return 1
+    if stop_flag.is_set():
+        return 0
 
-        prefetch_thread.join(timeout=30.0)
-        if "error" in prefetch_result:
-            _emit("error", msg=f"Synthesis error: {prefetch_result['error']}")
-            return 1
-        next_chunk = prefetch_result.get("chunk")
+    if not _player._started_first_chunk:
+        _emit("error", msg="No audio produced")
+        return 1
 
     _emit("done")
     return 0

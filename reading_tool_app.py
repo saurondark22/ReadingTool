@@ -51,8 +51,9 @@ class ReadingToolApp(QtWidgets.QApplication):
     # --- TTS worker management -------------------------------------------
     def start_read(self, text, voice, speed, on_event):
         """Spawn a TTS Worker for one Read. Returns the WorkerProcess."""
+        debug_mode = bool(self.config.get("debug_mode", False))
         worker = WorkerProcess(on_event=on_event)
-        worker.start(text, voice, speed)
+        worker.start(text, voice, speed, debug_mode=debug_mode)
         self._active_workers.append(worker)
         return worker
 

@@ -144,11 +144,28 @@ _RE_FILELINE = re.compile(
 # terminators (. ! ? : ").
 _RE_SOFT_NEWLINE = re.compile(r"([a-z,])\n([a-z])")
 
-# --- whitespace ------------------------------------------------------------
+# --- whitespace / line breaks ---------------------------------------------
+
+# Pure ASCII control chars that carry no speech and no line-break meaning.
+# Everything below 0x20 except HT(0x09)/LF(0x0A) — plus DEL(0x7F) — is dropped.
+# CR(0x0D) is normalized to LF before this runs, so it's safe to strip here.
+_RE_CONTROL_STRIP = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Normalize all line-break flavors to \n: CRLF -> \n, lone CR -> \n.
+_RE_LB_NORMALIZE = re.compile(r"\r\n?")
+
+# Any run of line breaks (and surrounding whitespace) becomes a single
+# sentence terminator. Runs after line-wrap repair, so only real line/
+# paragraph breaks reach it — every surviving break marks a statement
+# boundary, even lines that ended without punctuation.
+_RE_NEWLINE = re.compile(r"[ \t]*\n+[ \t]*")
+
+# Structural brackets carry no prosody and no speakable content; replace
+# with a space (collapsed later) so "foo (bar) baz" -> "foo bar baz".
+_RE_BRACKETS = re.compile(r"[\(\)\[\]\{\}]")
 
 _RE_LINE_WS = re.compile(r"[ \t]+$", re.MULTILINE)
 _RE_MULTISPACE = re.compile(r"[ \t]{2,}")
-_RE_BLANKLINES = re.compile(r"\n{3,}")
 
 
 def clean_for_tts(text: str) -> str:
@@ -161,58 +178,75 @@ def clean_for_tts(text: str) -> str:
         if ch in text:
             text = text.replace(ch, repl)
 
-    # 2. Quotes.
+    # 2. Normalize all line-break flavors to \n, then strip ASCII control
+    #    chars (< 0x20 except \t \n, plus DEL) — silent drop. Done early so
+    #    control chars can't pollute the line-break pass below.
+    text = _RE_LB_NORMALIZE.sub("\n", text)
+    text = _RE_CONTROL_STRIP.sub("", text)
+
+    # 3. Quotes.
     for ch, repl in _QUOTE_REPLACEMENTS.items():
         if ch in text:
             text = text.replace(ch, repl)
 
-    # 3. Dashes.
+    # 4. Dashes.
     text = _RE_EMDASH.sub(", ", text)
     text = _RE_ENDASH_RANGE.sub(r"\1 to \2", text)
     text = _RE_ENDASH.sub("-", text)
     text = _RE_FIGDASH.sub(", ", text)
 
-    # 4. Ellipsis -> three dots (espeak reads "..." as a pause).
+    # 5. Ellipsis -> three dots (espeak reads "..." as a pause).
     text = _RE_ELLIPSIS.sub("...", text)
 
-    # 5. Bullets / middle dots.
+    # 6. Bullets / middle dots.
     text = _RE_BULLET.sub("- ", text)
 
-    # 6. Arrows.
+    # 7. Arrows.
     text = _RE_ARROW.sub(" to ", text)
     text = _RE_ARROW_LEFT.sub(" from ", text)
     text = _RE_ARROW_UP.sub(" up ", text)
     text = _RE_ARROW_DOWN.sub(" down ", text)
 
-    # 7. Math / symbol -> prose.
+    # 8. Math / symbol -> prose.
     for ch, repl in _SYMBOL_MAP.items():
         if ch in text:
             text = text.replace(ch, repl)
 
-    # 8. Ligatures.
+    # 9. Ligatures.
     for ch, repl in _LIGATURE_MAP.items():
         if ch in text:
             text = text.replace(ch, repl)
 
-    # 9. CJK punctuation.
+    # 10. CJK punctuation.
     for ch, repl in _CJK_PUNCT_MAP.items():
         if ch in text:
             text = text.replace(ch, repl)
 
-    # 10. file.py:123 -> file.py, line 123
+    # 11. file.py:123 -> file.py, line 123
     text = _RE_FILELINE.sub(r"\1, line \2", text)
 
-    # 11. Line-wrap repair (conservative: only clear prose continuation).
+    # 12. Line-wrap repair (conservative: only clear prose continuation).
     text = _RE_SOFT_NEWLINE.sub(r"\1 \2", text)
 
-    # 12. Whitespace normalization.
+    # 13. Structural brackets -> space (no prosody, no speech).
+    text = _RE_BRACKETS.sub(" ", text)
+
+    # 14. Surviving line breaks -> sentence terminator ". ". Runs after
+    #     line-wrap repair, so only real statement boundaries reach it.
+    text = _RE_NEWLINE.sub(". ", text)
+
+    # 15. Whitespace normalization.
     text = _RE_LINE_WS.sub("", text)
     text = _RE_MULTISPACE.sub(" ", text)
-    text = _RE_BLANKLINES.sub("\n\n", text)
 
-    # 13. Strip outer whitespace.
+    # 16. Collapse stray ". ." runs (from break -> period adjacent to
+    #     existing punctuation) and tidy spacing before periods.
+    text = re.sub(r"(?:\s*\.\s*){2,}", ". ", text)
+    text = re.sub(r"\s+\.", ".", text)
+
+    # 17. Strip outer whitespace.
     text = text.strip()
 
-    # 14. Strip any remaining Cf-format chars that weren't in the map.
+    # 18. Strip any remaining Cf-format chars that weren't in the map.
     text = "".join(c for c in text if unicodedata.category(c) != "Cf")
     return text
