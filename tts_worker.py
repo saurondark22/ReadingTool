@@ -289,6 +289,11 @@ def _run():
     _emit("loading", phase="engine")
 
     try:
+        # Defense in depth: ensure model files exist before loading. The
+        # daemon gates on this too, but a worker spawned standalone (or a
+        # race the daemon misses) must not crash on a missing file.
+        _ensure_models()
+
         from tts_engine import TTSEngine
 
         engine = TTSEngine()

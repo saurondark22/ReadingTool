@@ -22,10 +22,15 @@ import urllib.request
 
 import numpy as np
 
-MODEL_FILENAME = "kokoro-v1.0.onnx"
+MODEL_FILENAME = "kokoro-v1.0.fp16.onnx"
 VOICES_FILENAME = "voices-v1.0.bin"
-MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.fp16.onnx"
 VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+# Models shipped by earlier builds; deleted on sight so they don't orphan
+# hundreds of MB on disk after the fp16 switch. fp32 was the original;
+# int8 was a brief interim that proved too slow for streaming (RTF 2.58).
+_OBSOLETE_MODEL_FILES = ("kokoro-v1.0.onnx", "kokoro-v1.0.int8.onnx")
 
 # Hard ceiling on a worker process. If it hasn't exited by this point the
 # Daemon kills it (safety net for a hung synth/playback with no audio).
@@ -58,6 +63,18 @@ def models_present():
 
 def download_models(on_progress=None):
     """Download model + voices files. on_progress receives (label, pct)."""
+    # ponytail: delete orphaned fp32 model from pre-int8 builds instead of
+    # leaving 311MB on disk. Best-effort — ignore failures (read-only fs,
+    # missing file, etc); the int8 download below is the real work.
+    for stale in _OBSOLETE_MODEL_FILES:
+        stale_path = os.path.join(models_dir(), stale)
+        try:
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+                logging.info(f"Removed obsolete model file: {stale}")
+        except OSError as e:
+            logging.warning(f"Could not remove obsolete {stale}: {e}")
+
     for label, url, dest in [
         ("Model", MODEL_URL, model_path()),
         ("Voices", VOICES_URL, voices_path()),
@@ -90,17 +107,31 @@ class TTSEngine:
         self._voices_path = voices_path()
 
     def ensure_load(self):
-        """Lazily load the Kokoro engine + model. Returns True on success."""
+        """Lazily load the Kokoro engine + model. Returns True on success.
+
+        Builds the onnxruntime InferenceSession directly and hands it to
+        Kokoro via ``from_session``. The default SessionOptions are used
+        (arena allocator ON): this workload makes many small ``sess.run()``
+        calls (one per Chunk), so the arena *reuses* memory across batches
+        and beats per-op malloc — measured ~298MB RSS vs ~559MB with the
+        arena disabled. The int8 model is what delivers the RAM cut
+        (~298MB vs ~555MB for fp32), not arena tuning.
+        """
         if self._kokoro is not None:
             return True
         try:
+            import onnxruntime as rt
             from kokoro_onnx import Kokoro
 
             logging.debug(
                 f"Loading Kokoro engine: model={self._model_path} voices={self._voices_path}"
             )
-            self._kokoro = Kokoro(self._model_path, self._voices_path)
-            logging.debug("Kokoro engine loaded")
+            session = rt.InferenceSession(
+                self._model_path,
+                providers=["CPUExecutionProvider"],
+            )
+            self._kokoro = Kokoro.from_session(session, self._voices_path)
+            logging.debug("Kokoro engine loaded (fp16)")
             return True
         except Exception as e:
             logging.error(f"Failed to load Kokoro engine: {e}", exc_info=True)

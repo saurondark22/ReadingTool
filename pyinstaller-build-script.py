@@ -66,8 +66,6 @@ def run_pyinstaller_build():
         # (QML, WebEngine, Quick, etc.) even when excluded below. Let
         # PyInstaller's PySide6 hook auto-detect the core modules we import.
         "--hidden-import",
-        "darkdetect",
-        "--hidden-import",
         "pyperclip",
         # Exclude heavy libs that belong to the worker only
         "--exclude-module",

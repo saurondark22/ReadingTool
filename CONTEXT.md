@@ -29,51 +29,55 @@ captured here as they are resolved during design.
   user-issued Stop.
 
 - **Stop** — User action that kills the TTS Worker process immediately,
-  halting both synthesis and audio. Available as a button in the
-  Playback Window. Re-pressing the hotkey during a Read acts as Stop.
-  There is no Pause/Resume — Stop is the only transport control
-  besides Play.
+  halting both synthesis and audio. Available as an item in the Tray
+  Icon's right-click menu. Re-pressing the hotkey during a Read acts as
+  Stop. There is no Pause/Resume — Stop is the only transport control.
 
 - **Speed** — Playback rate multiplier (Kokoro `speed` param), e.g.
-  1.0. A runtime slider in the Playback Window whose last-used value
-  is persisted to `config.json`. Speed is applied at Read start (when
-  the TTS Worker is spawned); changing the slider mid-playback takes
-  effect on the next Play.
+  1.0. A value in `config.json`, applied at Read start (when the TTS
+  Worker is spawned). The last-used value is persisted to `config.json`.
+  There is no runtime Speed control; Speed is set by editing
+  `config.json` (via the Tray Icon's Settings item, which opens the
+  file in the system's default editor).
 
-- **Playback Window** — A small foreground window that appears on
-  hotkey press, shows the captured Selection, auto-starts the Read
-  (spawning the TTS Worker), and exposes transport controls (Play,
-  Stop, Speed). Distinguished from the tray-only Settings window.
+- **Tray Icon** — The system-tray presence of the daemon. Its
+  right-click menu exposes Stop (kills any active Read), Settings
+  (opens `config.json` in the system's default editor), and Quit.
+  The daemon is otherwise headless; no window surfaces at runtime.
+  Status during a Read (Loading / Playing / Done / Error) is shown as
+  a native tray notification (balloon) emitted by the Daemon when the
+  TTS Worker reports the corresponding event.
 
 - **Voice** — A Kokoro voice id (e.g. `af_heart`) used for synthesis.
-  Configurable in Settings only.
+  Configurable in `config.json` only (edited via the Tray Icon's
+  Settings item).
 
 - **Hotkey** — The global keyboard shortcut that toggles a Read.
   When no Read Session is active, a press initiates a Read (capture
-  → synthesize → play) and shows the Playback Window. When a Read
-  Session is active OR the Playback Window is open, a press acts as
-  Stop and closes the Playback Window. Thus the hotkey is a one-key
-  toggle between "read this" and "be quiet." The window's own Stop
-  button halts playback without closing the window.
-
-- **Tray Icon** — The system-tray presence of the daemon. Provides
-  Settings and Quit. The daemon is otherwise headless; the only
-  window that surfaces at runtime is the transient Playback Window.
-
-- **Daemon** — The lightweight long-running background process (~30MB
-  resident) that owns the hotkey listener, the capture flow, and the
-  tray + Playback Window UI. It does **not** hold the TTS engine or
-  model in memory. Autostarted at login.
+  → synthesize → play). When a Read Session is active, a press acts as
+  Stop. Thus the hotkey is a one-key toggle between "read this" and
+  "be quiet."
 
 - **TTS Worker** — A short-lived subprocess spawned on demand by the
   Daemon when a Read begins. It loads the Kokoro ONNX engine +
   model, synthesizes the Selection into audio, and exits as soon as
   playback completes (or is killed by the Daemon on Stop / timeout).
-  The heavy resident memory (~150MB) lives only in this process and
-  is reclaimed the moment it exits.
+  The heavy resident memory lives only in this process and is
+  reclaimed the moment it exits. It runs the fp16 Kokoro model
+  (`kokoro-v1.0.fp16.onnx`, ~170MB) rather than the fp32 original
+  (~311MB) or the int8 quantization (~88MB). The model choice is
+  constrained by a hard realtime requirement: synthesis must be
+  faster than playback (RTF < 1.0) so the ringbuffer stays primed
+  and audio is gapless. fp16 measures RTF ~0.8 and ~600MB RSS; int8
+  measures RTF ~2.6 (dequantize-on-CPU overhead) and breaks streaming
+  despite lower RSS, so it is rejected even though it is the smallest.
+  onnxruntime's CPU memory arena is left enabled (default), because
+  this workload makes many small `sess.run()` calls (one per `Chunk`)
+  and the arena reuses memory across them.
 
 - **Settings** — User-editable configuration (voice, default speed,
-  hotkey) persisted to `config.json`, edited via the Settings window.
+  hotkey) persisted to `config.json`, edited via the Tray Icon's
+  Settings item (opens the file in the system's default editor).
 
 - **Phonemizer** — The G2P stage inside the TTS Worker that converts
   the cleaned `Selection` into IPA phonemes for the Kokoro model. It is
@@ -105,10 +109,9 @@ captured here as they are resolved during design.
   brackets dropped, ASCII control chars dropped, and every surviving
   line break converted to a sentence terminator (`". "`), but with
   prose, numbers, contractions, and prosody punctuation otherwise
-  untouched. It is the exact string handed to the `Phonemizer`. In
-  the current build the TTS Worker emits it back to the Daemon as the
-  `cleaned` event so the `Playback Window` can display it for
-  inspection.
+  untouched.   It is the exact string handed to the `Phonemizer`. In the
+  current build the TTS Worker emits it back to the Daemon as the
+  `cleaned` event (kept for diagnostics; no window displays it).
 
 - **Chunk** — One batch of phonemes that the TTS Worker synthesizes
   into one audio segment and feeds to the ringbuffer playback stream.

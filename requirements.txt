@@ -5,5 +5,4 @@ numpy
 pyperclip
 pynput
 PySide6
-darkdetect
 pyinstaller
